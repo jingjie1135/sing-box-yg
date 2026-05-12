@@ -4276,6 +4276,116 @@ sb
 fi
 }
 
+normalproxy_update(){
+local file=$1
+local mode=$2
+local tmp="${file}.tmp"
+if [ "$mode" = "add" ]; then
+normal_line=",{\"type\":\"mixed\",\"tag\":\"mixed-in\",\"listen\":\"::\",\"listen_port\":$normal_port,\"users\":[{\"username\":\"$normal_user\",\"password\":\"$normal_pass\"}]}"
+awk '{if ($0 ~ /"tag":"mixed-in"/) {print "],"; next} print}' "$file" > "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+awk -v line="$normal_line" 'BEGIN{done=0}{if (!done && $0 == "],") {print line "],"; done=1; next} print}END{if (!done) exit 1}' "$file" > "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+else
+awk '{if ($0 ~ /"tag":"mixed-in"/) {print "],"; next} print}' "$file" > "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+fi
+}
+
+normalproxy_sync(){
+for file in /etc/s-box/sb10.json /etc/s-box/sb11.json /etc/s-box/sb.json; do
+if [ -f "$file" ]; then
+cp "$file" "${file}.normalbak"
+normalproxy_update "$file" "$1" || { red "更新 $file 失败，请检查JSON配置"; exit; }
+fi
+done
+if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/tmp/sb_normalproxy_check.log 2>&1; then
+cat /tmp/sb_normalproxy_check.log 2>/dev/null
+for file in /etc/s-box/sb10.json /etc/s-box/sb11.json /etc/s-box/sb.json; do
+[ -f "${file}.normalbak" ] && mv "${file}.normalbak" "$file"
+done
+red "Sing-box配置检查失败，已恢复原配置"
+exit
+fi
+rm -f /etc/s-box/sb10.json.normalbak /etc/s-box/sb11.json.normalbak /etc/s-box/sb.json.normalbak /tmp/sb_normalproxy_check.log
+}
+
+normalproxy(){
+sbactive
+normal_now_port=$(jq -r '.inbounds[]? | select(.tag=="mixed-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null | head -n 1)
+normal_now_user=$(jq -r '.inbounds[]? | select(.tag=="mixed-in") | .users[0].username' /etc/s-box/sb.json 2>/dev/null | head -n 1)
+echo
+if [[ -n $normal_now_port ]]; then
+green "当前普通代理已开启：端口 $normal_now_port，用户名 $normal_now_user"
+else
+yellow "当前普通代理未开启"
+fi
+echo
+yellow "1：开启/重置普通代理 HTTP+SOCKS5 共用端口"
+yellow "2：关闭普通代理"
+yellow "0：返回主菜单"
+readp "请选择【0-2】：" menu
+if [ "$menu" = "1" ]; then
+while true; do
+readp "设置普通代理端口 (回车随机生成10000-65535端口)：" normal_port
+if [[ -z $normal_port ]]; then
+while true; do
+normal_port=$(shuf -i 10000-65535 -n 1)
+[[ -z $(ss -tunlp | awk '{print $5}' | sed 's/.*://g' | grep -w "$normal_port") ]] && break
+done
+break
+elif [[ $normal_port =~ ^[0-9]+$ && $normal_port -ge 1000 && $normal_port -le 65535 ]]; then
+if [[ "$normal_port" != "$normal_now_port" && -n $(ss -tunlp | awk '{print $5}' | sed 's/.*://g' | grep -w "$normal_port") ]]; then
+red "端口 $normal_port 已被占用，请重新输入"
+else
+break
+fi
+else
+red "端口输入错误，请输入1000-65535之间的数字"
+fi
+done
+while true; do
+readp "设置普通代理用户名 (回车默认 sbyg)：" normal_user
+[[ -z $normal_user ]] && normal_user=sbyg
+if [[ $normal_user =~ ^[A-Za-z0-9._@-]+$ ]]; then
+break
+else
+red "用户名仅支持字母、数字、点、下划线、@、横杠"
+fi
+done
+while true; do
+readp "设置普通代理密码 (回车随机生成)：" normal_pass
+if [[ -z $normal_pass ]]; then
+normal_pass=$(openssl rand -hex 12 2>/dev/null || /etc/s-box/sing-box generate rand --hex 12 2>/dev/null)
+[[ -z $normal_pass ]] && normal_pass=$(date +%s%N | sha256sum | awk '{print substr($1,1,24)}')
+break
+elif [[ $normal_pass =~ ^[A-Za-z0-9._@=-]+$ ]]; then
+break
+else
+red "密码仅支持字母、数字、点、下划线、@、=、横杠"
+fi
+done
+normalproxy_sync add
+restartsb
+normal_ip=$(cat /etc/s-box/server_ip.log 2>/dev/null)
+[[ -z $normal_ip ]] && normal_ip=$(curl -s4m5 icanhazip.com -k || curl -s6m5 icanhazip.com -k)
+echo
+blue "普通代理已开启，一个端口同时支持 HTTP/HTTPS 与 SOCKS5"
+blue "HTTP/HTTPS代理：$normal_ip:$normal_port"
+blue "SOCKS5代理：$normal_ip:$normal_port"
+blue "用户名：$normal_user"
+blue "密码：$normal_pass"
+yellow "请确认VPS安全组或云防火墙已放行TCP端口 $normal_port"
+elif [ "$menu" = "2" ]; then
+if [[ -z $normal_now_port ]]; then
+yellow "普通代理未开启，无需关闭"
+else
+normalproxy_sync del
+restartsb
+green "普通代理已关闭"
+fi
+else
+sb
+fi
+}
+
 sbsm(){
 echo
 green "关注甬哥YouTube频道：https://youtube.com/@ygkkk?sub_confirmation=1 了解最新代理协议与翻墙动态"
@@ -4326,6 +4436,7 @@ green "14. 添加 WARP-plus-Socks5 代理模式 【本地Warp/多地区Psiphon-V
 green "15. 刷新本地IP、调整IPV4/IPV6配置输出"
 white "----------------------------------------------------------------------------------"
 green "16. Sing-box-yg脚本使用说明书"
+green "17. 管理普通代理 HTTP/SOCKS5"
 white "----------------------------------------------------------------------------------"
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -4438,7 +4549,7 @@ showprotocol
 fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
-readp "请输入数字【0-16】:" Input
+readp "请输入数字【0-17】:" Input
 case "$Input" in  
  1 ) instsllsingbox;;
  2 ) unins;;
@@ -4456,5 +4567,6 @@ case "$Input" in
 14 ) inssbwpph;;
 15 ) wgcfgo && sbshare;;
 16 ) sbsm;;
+17 ) normalproxy;;
  * ) exit 
 esac
